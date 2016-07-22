@@ -142,9 +142,10 @@ tryServer (int i, int s, rtems_bsdnet_ntp_callback_t callback, void *usr_data)
 	}
 
 	if ( i >= sizeof packet &&
-		((packet.li_vn_mode & (0x7 << 3)) == (3 << 3)) &&
-	    ((packet.transmit_timestamp.integer != 0) || (packet.transmit_timestamp.fraction != 0)) &&
-		0 == callback( &packet, 0 , usr_data) )
+             (((packet.li_vn_mode & (0x7 << 3)) == (3 << 3)) ||
+              ((packet.li_vn_mode & (0x7 << 3)) == (4 << 3))) &&
+              ((packet.transmit_timestamp.integer != 0) || (packet.transmit_timestamp.fraction != 0)) &&
+               0 == callback( &packet, 0 , usr_data) )
 		return 0;
 
 	return -1;
@@ -192,7 +193,7 @@ int ret;
 		 * and hope that there's an NTP broadcast
 		 * server out there somewhere.
 		 */
-		if (rtems_bsdnet_ntpserver_count < 0) {
+		if (rtems_bsdnet_ntpserver_count <= 0) {
 			ret = tryServer (-1, sock, callback, usr_data);
 		}
 		else {
