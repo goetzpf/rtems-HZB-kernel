@@ -2616,9 +2616,6 @@ Nfs		nfs  = node->nfs;
 	if (count > NFS_MAXDATA)
 		count = NFS_MAXDATA;
 
-	if (count > nfsStBlksize)
-		count = nfsStBlksize;
-
 	SERP_ARGS(node).readarg.offset		= iop->offset;
 	SERP_ARGS(node).readarg.count	  	= count;
 	SERP_ARGS(node).readarg.totalcount	= UINT32_C(0xdeadbeef);
@@ -2723,8 +2720,6 @@ int			e;
 	if (count > NFS_MAXDATA)
 		count = NFS_MAXDATA;
 
-	if (count > nfsStBlksize)
-		count = nfsStBlksize;
 
 	SERP_ARGS(node).writearg.beginoffset   = UINT32_C(0xdeadbeef);
 	if ( LIBIO_FLAGS_APPEND & iop->flags ) {
