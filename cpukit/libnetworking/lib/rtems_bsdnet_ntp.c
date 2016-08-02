@@ -106,6 +106,7 @@ tryServer (int i, int s, rtems_bsdnet_ntp_callback_t callback, void *usr_data)
 	struct timeval tv;
 	socklen_t farlen;
 	struct sockaddr_in farAddr;
+	struct sockaddr_in farAddr_cpy;
 	struct ntpPacketSmall packet;
 
 	if (i < 0)
@@ -132,7 +133,7 @@ tryServer (int i, int s, rtems_bsdnet_ntp_callback_t callback, void *usr_data)
                         if (i==0)
                                 break;
                         if (i < 0) {
-                                if (!((errno == EWOULDBLOCK) || (errno == EAGAIN)) || NTP_TRACE)
+                                if (!((errno == EWOULDBLOCK) || (errno == EAGAIN)))
                                         fprintf (stderr, "RTEMS: trywait: recvfrom errno: %d (%s)\n", errno, strerror(errno));
                                 break;
                         }
