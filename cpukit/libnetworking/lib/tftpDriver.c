@@ -11,6 +11,16 @@
  *
  *  $Id$
  *
+ * Bugfix of TFTP read by Goetz Pfeiffer <Goetz.Pfeiffer@helmholtz-berlin.de>:
+ *
+ * The old implementation reads only enough TFTP packages to satisfy the
+ * application's read request. When read() returns, the TFTP server sends the
+ * next package. Since it doesn't get an acknowledge, it sends the package
+ * again and again. If the application doesn't call read() soon enough, the
+ * server detects a timeout and closes the connection.
+ * In order to avoid this, the file is now read completely and stored in a
+ * filebuffer structure. This structure is allocated on the heap and released
+ * when close() is called on the file.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -65,6 +75,153 @@ int rtems_tftp_driver_debug = 1;
  * Largest data transfer
  */
 #define TFTP_BUFSIZE        512
+
+/* --------------------------------------------------------- 
+ * filebuffer functions
+ */
+
+#define FILEBUFFER_SIZE 512
+
+#define MIN(x,y) ((x)<(y)) ? (x) : (y)
+#define MAX(x,y) ((x)>(y)) ? (x) : (y)
+
+typedef struct fblock_struct {
+    struct fblock_struct *next;
+    char data[0];
+} fblock;
+
+typedef struct {
+    size_t fblock_size;
+    fblock *first;
+    fblock *last;
+    /* rcursor: the position of the next byte to read */
+    fblock *rcursor_block;
+    int rcursor_in_block;
+    /* wcursor: position of the next byte to write
+     *          >=fblock_size must allocate new block before writing 
+     */
+    int wcursor_in_block;
+} filebuffer;
+
+static filebuffer *filebuffer_new(size_t fblock_size)
+{
+    filebuffer *fb = calloc(1, sizeof(filebuffer));
+    fb->fblock_size = fblock_size;
+    fb->first = NULL;
+    fb->last = NULL;
+    fb->rcursor_block = NULL;
+    fb->rcursor_in_block = 0;
+    fb->wcursor_in_block = fblock_size;
+    return fb;
+}
+
+static void filebuffer_delete(filebuffer * fb)
+{
+    fblock *b, *n;
+
+    for (b = fb->first; b; b = n) {
+	n = b->next;
+	free(b);
+    }
+    free(fb);
+}
+
+static void filebuffer_append(filebuffer * fb, void *data, size_t size)
+{
+    fblock *b = fb->last;
+    size_t to_copy;
+    char *src = (char *) data;
+
+    while (size > 0) {
+	if (fb->wcursor_in_block >= fb->fblock_size) {
+	    b = calloc(1, sizeof(fblock) + fb->fblock_size);
+	    /* b->next==NULL due to use of calloc */
+	    if (!fb->first)
+		fb->first = b;
+	    else
+		fb->last->next = b;
+	    fb->wcursor_in_block = 0;
+	    fb->last = b;
+	}
+	to_copy = MIN(size, fb->fblock_size - fb->wcursor_in_block);
+	memcpy(fb->last->data + fb->wcursor_in_block, src, to_copy);
+	src += to_copy;
+	size -= to_copy;
+	fb->wcursor_in_block += to_copy;
+    }
+}
+
+static size_t filebuffer_read(filebuffer * fb, void *dest, size_t max_size)
+{
+    char *dst = (char *) dest;
+    size_t to_copy;
+    size_t remaining_in_block;
+    size_t blocksize;
+    size_t read = 0;
+    size_t remaining = max_size;
+
+    if (!fb->last)
+	return 0;
+
+    if (!fb->rcursor_block) {
+	fb->rcursor_block = fb->first;
+	fb->rcursor_in_block = 0;
+    }
+
+    while (remaining > 0) {
+	if (fb->rcursor_in_block >= fb->fblock_size) {
+	    fb->rcursor_block = fb->rcursor_block->next;
+	    if (!fb->rcursor_block)
+		break;
+	    fb->rcursor_in_block = 0;
+	}
+	blocksize = (fb->rcursor_block == fb->last) ?
+	    fb->wcursor_in_block : fb->fblock_size;
+	remaining_in_block = blocksize - fb->rcursor_in_block;
+	to_copy = MIN(remaining_in_block, remaining);
+	if (to_copy <= 0)
+	    break;
+	memcpy(dst, fb->rcursor_block->data + fb->rcursor_in_block,
+	       to_copy);
+	read += to_copy;
+	dst += to_copy;
+	remaining -= to_copy;
+	fb->rcursor_in_block += to_copy;
+    }
+    return read;
+}
+
+# if 0
+/* the following two functions are currently not needed.*/
+
+static void filebuffer_reset_rcursor(filebuffer *fb)
+{
+    fb->rcursor_block= fb->first;
+    fb->rcursor_in_block= 0;
+}
+
+static void filebuffer_print(filebuffer *fb)
+{
+  char buf[129];
+  int l;
+
+  filebuffer_reset_rcursor(fb);
+  for(;;) {
+      l= filebuffer_read(fb, buf, 128);
+      if (l) {
+          buf[l] = 0;
+          fputs(buf, stdout);
+      };
+      if (l<128)
+	      break;
+  }
+  filebuffer_reset_rcursor(fb);
+}
+#endif
+
+/* --------------------------------------------------------- */
+
+
 
 /*
  * Packets transferred between machines
@@ -131,6 +288,9 @@ struct tftpStream {
      */
     int     nleft;
     int     nused;
+
+    /* filebuffer, used for reading */
+    filebuffer *fb;
 
     /*
      * Flags
@@ -249,6 +409,9 @@ releaseStream (tftpfs_info_t *fs, int s)
     if (fs->tftpStreams[s] && (fs->tftpStreams[s]->socket >= 0))
         close (fs->tftpStreams[s]->socket);
     rtems_semaphore_obtain (fs->tftp_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+    if (fs->tftpStreams[s]->fb) 
+        filebuffer_delete(fs->tftpStreams[s]->fb);
+
     free (fs->tftpStreams[s]);
     fs->tftpStreams[s] = NULL;
     rtems_semaphore_release (fs->tftp_mutex);
@@ -386,6 +549,20 @@ getPacket (struct tftpStream *tp, int retryCount)
         else {
             printf ("TFTP: %d-byte packet\n", len);
         }
+#if 0
+        /* dump loaded package: */
+        { 
+          int bytes= len-sizeof(tp->pkbuf.tftpACK);
+          if (bytes) { 
+              int i;
+              printf("TFTP: data:\n");
+              printf("------------------------------------------------------\n");
+              for(i=0; i<bytes; i++)
+                printf("%c", tp->pkbuf.tftpDATA.data[i]);
+              printf("\n------------------------------------------------------\n");
+          }
+        }
+#endif
     }
 #endif
     return len;
@@ -541,6 +718,46 @@ static int rtems_tftp_eval_path(
     return 0;
 }
 
+static int consume(struct tftpStream *tp)
+{
+    /* read a file completely and store all data in tf->fp, a filebuffer. */
+    int bytes, len;
+    int retryCount;
+    for(;;) {
+        retryCount= 0;
+        for(;;) {
+            len = getPacket (tp, retryCount);
+            if (len >= (int)sizeof tp->pkbuf.tftpACK) {
+                int opcode = ntohs (tp->pkbuf.tftpDATA.opcode);
+                uint16_t   nextBlock = tp->blocknum + 1;
+                bytes= len-sizeof(tp->pkbuf.tftpACK);
+                if ((opcode == TFTP_OPCODE_DATA)
+                 && (ntohs (tp->pkbuf.tftpDATA.blocknum) == nextBlock)) {
+                    if (bytes>0) {
+
+                        filebuffer_append(tp->fb, tp->pkbuf.tftpDATA.data, 
+                                          bytes);
+                        tp->blocknum++;
+                    }
+                    if (sendAck (tp) != 0)
+                        return( EIO );
+                    break; /* inner loop */
+                }
+                if (opcode == TFTP_OPCODE_ERROR)
+                    return(tftpErrno (tp));
+            }
+            if (++retryCount == IO_RETRY_LIMIT)
+                return( EIO );
+            if (sendAck (tp) != 0)
+                return( EIO );
+        }
+        if (bytes<TFTP_BUFSIZE)
+            /* end of transmission */
+            break;
+    }
+    return 0;
+}
+
 /*
  * The routine which does most of the work for the IMFS open handler
  */
@@ -572,6 +789,10 @@ static int rtems_tftp_open_worker(
     /*
      * Extract the host name component
      */
+#ifdef RTEMS_TFTP_DRIVER_DEBUG
+    if (rtems_tftp_driver_debug) 
+        printf("TFTP: read file '%s'\n",full_path_name);
+#endif
     hostname = full_path_name;
     cp1 = strchr (full_path_name, ':');
     if (!cp1) /* if can't use : as delimiter, try / */
@@ -640,6 +861,9 @@ static int rtems_tftp_open_worker(
     iop->data0 = s;
     iop->data1 = tp;
 
+    /* initialize filebuffer pointer: */
+    tp->fb= NULL;
+
     /*
      * Create the socket
      */
@@ -687,6 +911,9 @@ static int rtems_tftp_open_worker(
         if ((flags & O_ACCMODE) == O_RDONLY) {
             tp->writing = 0;
             tp->pkbuf.tftpRWRQ.opcode = htons (TFTP_OPCODE_RRQ);
+            if (tp->fb)
+                filebuffer_delete(tp->fb);
+            tp->fb= filebuffer_new(FILEBUFFER_SIZE);
         }
         else {
             tp->writing = 1;
@@ -714,42 +941,41 @@ static int rtems_tftp_open_worker(
         /*
          * Get reply
          */
-        len = getPacket (tp, retryCount);
-        if (len >= (int) sizeof tp->pkbuf.tftpACK) {
-            int opcode = ntohs (tp->pkbuf.tftpDATA.opcode);
-            if (!tp->writing
-             && (opcode == TFTP_OPCODE_DATA)
-             && (ntohs (tp->pkbuf.tftpDATA.blocknum) == 1)) {
-                tp->nused = 0;
-                tp->blocknum = 1;
-                tp->nleft = len - 2 * sizeof (uint16_t  );
-                tp->eof = (tp->nleft < TFTP_BUFSIZE);
-                if (sendAck (tp) != 0) {
-                    releaseStream (fs, s);
-                    return EIO;
-                }
-                break;
-            }
-            if (tp->writing
-             && (opcode == TFTP_OPCODE_ACK)
-             && (ntohs (tp->pkbuf.tftpACK.blocknum) == 0)) {
-                tp->nused = 0;
-                tp->blocknum = 1;
-                break;
-            }
-            if (opcode == TFTP_OPCODE_ERROR) {
-                int e = tftpErrno (tp);
+        if (!tp->writing) {
+            int rc;
+            tp->blocknum = 0;
+            rc= consume(tp);
+            if (rc) {
+                close (tp->socket);
                 releaseStream (fs, s);
-                return e;
+                return rc;
             }
-        }
+            break;
+        } else {
+            len = getPacket (tp, retryCount);
+            if (len >= (int) sizeof tp->pkbuf.tftpACK) {
+                int opcode = ntohs (tp->pkbuf.tftpDATA.opcode);
+                if (tp->writing
+                 && (opcode == TFTP_OPCODE_ACK)
+                 && (ntohs (tp->pkbuf.tftpACK.blocknum) == 0)) {
+                    tp->nused = 0;
+                    tp->blocknum = 1;
+                    break;
+                }
+                if (opcode == TFTP_OPCODE_ERROR) {
+                    int e = tftpErrno (tp);
+                    releaseStream (fs, s);
+                    return e;
+                }
+            }
 
-        /*
-         * Keep trying
-         */
-        if (++retryCount >= OPEN_RETRY_LIMIT) {
-            releaseStream (fs, s);
-            return EIO;
+            /*
+             * Keep trying
+             */
+            if (++retryCount >= OPEN_RETRY_LIMIT) {
+                releaseStream (fs, s);
+                return EIO;
+            }
         }
     }
     return 0;
@@ -846,76 +1072,20 @@ static int rtems_tftp_open(
 /*
  * Read from a TFTP stream
  */
+
 static ssize_t rtems_tftp_read(
     rtems_libio_t *iop,
     void          *buffer,
     size_t         count
 )
 {
-    char              *bp;
     struct tftpStream *tp = iop->data1;
-    int               retryCount;
-    int               nwant;
+    filebuffer *fb= tp->fb;
 
-    if (!tp)
+    if (!fb) 
         rtems_set_errno_and_return_minus_one( EIO );
-    
-    /*
-     * Read till user request is satisfied or EOF is reached
-     */
-    bp = buffer;
-    nwant = count;
-    while (nwant) {
-        if (tp->nleft) {
-            int ncopy;
-            if (nwant < tp->nleft)
-                ncopy = nwant;
-            else
-                ncopy = tp->nleft;
-            memcpy (bp, &tp->pkbuf.tftpDATA.data[tp->nused], ncopy);
-            tp->nused += ncopy;
-            tp->nleft -= ncopy;
-            bp += ncopy;
-            nwant -= ncopy;
-            if (nwant == 0)
-                break;
-        }
-        if (tp->eof)
-            break;
 
-        /*
-         * Wait for the next packet
-         */
-        retryCount = 0;
-        for (;;) {
-            int len = getPacket (tp, retryCount);
-            if (len >= (int)sizeof tp->pkbuf.tftpACK) {
-                int opcode = ntohs (tp->pkbuf.tftpDATA.opcode);
-                uint16_t   nextBlock = tp->blocknum + 1;
-                if ((opcode == TFTP_OPCODE_DATA)
-                 && (ntohs (tp->pkbuf.tftpDATA.blocknum) == nextBlock)) {
-                    tp->nused = 0;
-                    tp->nleft = len - 2 * sizeof (uint16_t);
-                    tp->eof = (tp->nleft < TFTP_BUFSIZE);
-                    tp->blocknum++;
-                    if (sendAck (tp) != 0)
-                        rtems_set_errno_and_return_minus_one (EIO);
-                    break;
-                }
-                if (opcode == TFTP_OPCODE_ERROR)
-                    rtems_set_errno_and_return_minus_one (tftpErrno (tp));
-            }
-
-            /*
-             * Keep trying?
-             */
-            if (++retryCount == IO_RETRY_LIMIT)
-                rtems_set_errno_and_return_minus_one (EIO);
-            if (sendAck (tp) != 0)
-                rtems_set_errno_and_return_minus_one (EIO);
-        }
-    }
-    return count - nwant;
+    return filebuffer_read(fb, buffer, count);
 }
 
 /*
